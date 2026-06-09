@@ -4,7 +4,6 @@
  */
 
 import React, { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI } from '@google/genai';
 import { 
   Sparkles, 
   BookOpen, 
@@ -43,7 +42,17 @@ import {
 } from './utils';
 
 import DreamNebulaUniverse from './components/DreamNebulaUniverse';
-import { getGeminiApiKey } from './config';
+
+class GeminiClientError extends Error {
+  constructor(
+    message: string,
+    public readonly errorType: 'api_key_missing' | 'gemini_request_failed' | 'network_error' | 'invalid_response' = 'gemini_request_failed',
+    public readonly detail?: string
+  ) {
+    super(message);
+    this.name = 'GeminiClientError';
+  }
+}
 
 export default function App() {
   // --- STATES ---
@@ -76,7 +85,7 @@ export default function App() {
 
   // API settings modal states
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
-  const [tempApiKey, setTempApiKey] = useState(() => localStorage.getItem('dream_gemini_api_key') || '');
+  const [tempApiKey, setTempApiKey] = useState('');
   const [apiTestStatus, setApiTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [apiTestMsg, setApiTestMsg] = useState('');
 
@@ -263,109 +272,110 @@ export default function App() {
     personaId: 'gentle' | 'poetic' | 'listener',
     attachedImageUrl: string | null
   ): Promise<string> => {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
-      throw new Error('API key unconfigured');
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
-    
-    // Last 8 messages is plenty
-    const recentHist = sessionHistory.slice(-8);
-    
-    const contents = recentHist.map(m => {
-      const role = m.sender === 'user' ? 'user' : 'model';
+    const recentHist = sessionHistory.slice(-8).map(m => {
       let text = m.text;
-      
-      // Supplement images context within user text if attached back then
+
       if (m.sender === 'user' && m.image) {
         const imgDesc = INSPIRE_IMAGES.find(img => img.url === m.image)?.description || '意象草图';
         text = `${text}\n[系统提示：用户当时上传了代表梦境潜意识的意象碎片图片，画面为：“${imgDesc}”]`;
       }
-      
+
+      if (m.sender === 'user' && attachedImageUrl && m === sessionHistory[sessionHistory.length - 1]) {
+        const imgDesc = INSPIRE_IMAGES.find(img => img.url === attachedImageUrl)?.description || '意象草图';
+        text += `\n[系统提示：用户当前正载入了一件视觉潜意识标本图斑，画面描述为：“${imgDesc}”。请你像看到它一样温柔提及：'我看见了这个画面。它像是这场梦里的一个视觉锚点……' 并且以此意境进行文学/共情层面的梦境拼接！]`;
+      }
+
       return {
-        role,
-        parts: [{ text }]
+        sender: m.sender,
+        text,
       };
     });
 
-    const systemInstruction = getPersonaSystemPrompt(personaId);
+    try {
+      const response = await fetch('/.netlify/functions/gemini', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage: recentHist[recentHist.length - 1]?.text || '',
+          currentCompanion: personaId,
+          conversationHistory: recentHist,
+          systemInstruction: getPersonaSystemPrompt(personaId),
+        }),
+      });
 
-    // If there's an active image attached in current message, pass it explicitly as instruction
-    if (attachedImageUrl) {
-      let lastUserItem = null;
-      for (let i = contents.length - 1; i >= 0; i--) {
-        if (contents[i].role === 'user') {
-          lastUserItem = contents[i];
-          break;
-        }
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch (parseErr) {
+        throw new GeminiClientError('Gemini 返回结构异常。', 'invalid_response', String(parseErr));
       }
-      if (lastUserItem) {
-        const imgDesc = INSPIRE_IMAGES.find(img => img.url === attachedImageUrl)?.description || '意象草图';
-        lastUserItem.parts[0].text += `\n[系统提示：用户当前正载入了一件视觉潜意识标本图斑，画面描述为：“${imgDesc}”。请你像看到它一样温柔提及：'我看见了这个画面。它像是这场梦里的一个视觉锚点……' 并且以此意境进行文学/共情层面的梦境拼接！]`;
+
+      if (!response.ok) {
+        const type = payload?.errorType || 'gemini_request_failed';
+        const message = payload?.message || payload?.error || 'Gemini 请求失败。';
+        throw new GeminiClientError(message, type, payload?.detail);
       }
+
+      if (!payload || typeof payload.reply !== 'string' || !payload.reply.trim()) {
+        throw new GeminiClientError('Gemini 返回结构异常。', 'invalid_response', JSON.stringify(payload));
+      }
+
+      return payload.reply.trim();
+    } catch (err) {
+      if (err instanceof GeminiClientError) {
+        throw err;
+      }
+      throw new GeminiClientError('网络错误，无法连接到 Gemini 代理函数。', 'network_error', String(err));
     }
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
-      contents,
-      config: {
-        systemInstruction,
-        temperature: 0.85,
-      }
-    });
-
-    if (!response.text) {
-      throw new Error('Empty text received');
-    }
-
-    return response.text;
   };
 
   // --- API KEY CONFIG & TESTERS ---
   const handleTestConnection = async () => {
-    if (!tempApiKey || tempApiKey.trim() === '') {
-      setApiTestStatus('error');
-      setApiTestMsg('请先输入 Gemini API Key！');
-      return;
-    }
     setApiTestStatus('testing');
     setApiTestMsg('正在测试连接……');
     try {
-      const ai = new GoogleGenAI({ apiKey: tempApiKey.trim() });
-      const response = await ai.models.generateContent({
-        model: 'gemini-1.5-flash',
-        contents: '请只回复：巡梦 API 已连接。',
+      const response = await fetch('/.netlify/functions/gemini', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage: '请只回复：巡梦 API 已连接。',
+          currentCompanion: selectedPersonaId,
+          conversationHistory: [{ sender: 'user', text: '请只回复：巡梦 API 已连接。' }],
+          systemInstruction: '请只回复：巡梦 API 已连接。',
+        }),
       });
-      if (response && response.text) {
+
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new GeminiClientError(
+          payload?.message || 'Gemini 请求失败。',
+          payload?.errorType || 'gemini_request_failed',
+          payload?.detail
+        );
+      }
+
+      if (payload && typeof payload.reply === 'string' && payload.reply.trim()) {
         setApiTestStatus('success');
-        setApiTestMsg(`连接成功：${response.text.trim()}`);
+        setApiTestMsg(`连接成功：${payload.reply.trim()}`);
       } else {
-        throw new Error('未收到有效的回复内容');
+        throw new GeminiClientError('返回结构异常：未收到有效 reply。', 'invalid_response', JSON.stringify(payload));
       }
     } catch (err: any) {
       console.error('Gemini API test connection failed:', err);
       setApiTestStatus('error');
-      setApiTestMsg(`连接失败，请检查 API Key 或网络环境。`);
+      setApiTestMsg(err?.message || '连接失败，请检查 Netlify 环境变量或网络。');
     }
   };
 
   const handleSaveApiKey = () => {
-    if (tempApiKey.trim()) {
-      localStorage.setItem('dream_gemini_api_key', tempApiKey.trim());
-      setApiTestStatus('success');
-      setApiTestMsg('API Key 已成功保存于本地浏览器缓存！');
-    } else {
-      setApiTestStatus('error');
-      setApiTestMsg('请先输入有效的 API Key！');
-    }
+    setApiTestStatus('idle');
+    setApiTestMsg('请在 Netlify 环境变量中配置 GEMINI_API_KEY，前端不会保存真实 Key。');
   };
 
   const handleClearApiKey = () => {
-    localStorage.removeItem('dream_gemini_api_key');
     setTempApiKey('');
     setApiTestStatus('idle');
-    setApiTestMsg('已成功清除本地保存的 API Key。');
+    setApiTestMsg('本地输入已清空。真实 Key 只应在 Netlify 环境变量中管理。');
   };
 
   const handleSendMessage = async (textToSend?: string, isAudioMsg: boolean = false, audioSecs: number = 0, customImg: string | null = null) => {
@@ -373,15 +383,6 @@ export default function App() {
     const finalImage = customImg || attachedImage;
     
     if (!text.trim() && !finalImage && !isAudioMsg) return;
-
-    // Check localStorage for dream_gemini_api_key
-    const savedKey = localStorage.getItem('dream_gemini_api_key');
-    if (!savedKey || savedKey.trim() === '') {
-      setVoiceError('请先在 API 设置中填写 Gemini API Key。');
-      setTimeout(() => setVoiceError(null), 5000);
-      playAmbientTone(250, 'sine', 0.5, 0.1);
-      return;
-    }
 
     // CANCEL active reading
     if (window.speechSynthesis) {
@@ -418,11 +419,11 @@ export default function App() {
     try {
       // 1. Try to call Google Gemini API Live
       simulatedText = await callGeminiAPI(nextMessages, selectedPersonaId, finalImage);
-    } catch (err) {
-      console.warn('Gemini API call skipped or failed, falling back to mock response:', err);
+    } catch (err: any) {
+      console.error('Gemini API call failed, falling back to mock response:', err);
       
       // Show notification
-      setVoiceError('API 调用失败已切换为 Demo 模拟回复。');
+      setVoiceError(`${err?.message || 'Gemini 请求失败。'} 已切换为 Demo 模拟回复。`);
       setTimeout(() => setVoiceError(null), 4000);
 
       // Gentle fallback / mock
@@ -820,21 +821,21 @@ export default function App() {
           {/* API Setup Button */}
           <button
             onClick={() => {
-              setTempApiKey(localStorage.getItem('dream_gemini_api_key') || '');
+              setTempApiKey('');
               setApiTestStatus('idle');
               setApiTestMsg('');
               setShowApiKeyModal(true);
             }}
             className={`px-3 py-1.5 rounded-lg border text-xs font-serif transition-all flex items-center space-x-1.5 cursor-pointer ${
-              localStorage.getItem('dream_gemini_api_key')
+              apiTestStatus === 'success'
                 ? 'bg-purple-950/40 border-purple-500/30 text-purple-200 shadow-[0_0_12px_rgba(168,85,247,0.15)] hover:bg-purple-900/40'
-                : 'bg-red-950/20 border-red-900/30 text-red-300 hover:bg-red-950/30'
+                : 'bg-purple-950/20 border-purple-900/30 text-purple-300 hover:bg-purple-950/30'
             }`}
-            title="配置 Gemini API Key"
+            title="测试 Gemini API"
           >
             <Settings className="w-3.5 h-3.5 text-purple-400" />
             <span>API 设置</span>
-            {localStorage.getItem('dream_gemini_api_key') && (
+            {apiTestStatus === 'success' && (
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
             )}
           </button>
@@ -1004,14 +1005,14 @@ export default function App() {
                     <div className="flex items-center space-x-1.5 mt-0.5">
                       <h4 className="text-xs font-serif text-white opacity-90 leading-none">巡梦进行中</h4>
                       <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[8px] font-mono scale-95 origin-left border ${
-                        localStorage.getItem('dream_gemini_api_key')
+                        apiTestStatus === 'success'
                           ? 'bg-[#091a14] text-emerald-400 border-emerald-950'
                           : 'bg-[#1a1409] text-yellow-500 border-yellow-950'
                       }`}>
                         <span className={`w-1 h-1 rounded-full mr-1 ${
-                          localStorage.getItem('dream_gemini_api_key') ? 'bg-emerald-400' : 'bg-yellow-400 animate-pulse'
+                          apiTestStatus === 'success' ? 'bg-emerald-400' : 'bg-yellow-400 animate-pulse'
                         }`} />
-                        {localStorage.getItem('dream_gemini_api_key') ? 'Gemini 已连接' : 'Demo 模拟模式'}
+                        {apiTestStatus === 'success' ? 'Gemini 已连接' : 'Gemini 待测试'}
                       </span>
                     </div>
                   </div>
@@ -1837,9 +1838,9 @@ export default function App() {
                 <span className="text-[10px] uppercase font-mono tracking-widest text-[#8a63ff] flex items-center justify-center gap-1">
                   <Key className="w-3 h-3" /> Gemini Access Tunnel / 梦境密钥接口
                 </span>
-                <h4 className="font-serif text-base text-white font-medium">配置伴梦者 AI API Key</h4>
+                <h4 className="font-serif text-base text-white font-medium">测试伴梦者 AI 连接</h4>
                 <p className="text-[11px] text-gray-400 font-serif leading-relaxed">
-                  请输入你的 <strong>Gemini API Key</strong> 来开启真实的陪伴回复与解梦体验：
+                  真实 API Key 只从 Netlify 环境变量 <strong>GEMINI_API_KEY</strong> 读取，前端不会保存密钥。
                 </p>
               </div>
 
@@ -1850,7 +1851,8 @@ export default function App() {
                     type="password"
                     value={tempApiKey}
                     onChange={(e) => setTempApiKey(e.target.value)}
-                    placeholder="AI_zaSy..."
+                    placeholder="Netlify: GEMINI_API_KEY"
+                    readOnly
                     className="w-full bg-black/50 border border-white/[0.08] rounded-xl px-3.5 py-3 text-xs text-white focus:outline-none focus:border-indigo-500/50 font-mono text-center tracking-wider"
                   />
                 </div>
@@ -1860,11 +1862,11 @@ export default function App() {
                   <div className="flex items-center justify-between text-[11px] mb-1">
                     <span className="text-gray-500 font-serif font-serif">配置状态 :</span>
                     <span className={`font-serif px-2 py-0.5 rounded-md text-[10px] ${
-                      !localStorage.getItem('dream_gemini_api_key')
-                        ? 'bg-red-950/20 text-red-300 border border-red-900/20'
-                        : 'bg-emerald-950/30 text-emerald-300 border border-emerald-900/10'
+                      apiTestStatus === 'success'
+                        ? 'bg-emerald-950/30 text-emerald-300 border border-emerald-900/10'
+                        : 'bg-yellow-950/20 text-yellow-300 border border-yellow-900/20'
                     }`}>
-                      {localStorage.getItem('dream_gemini_api_key') ? '✓ API Key 已保存' : '✗ API Key 未配置'}
+                      {apiTestStatus === 'success' ? '✓ Gemini 已连接' : '需测试 Netlify Function'}
                     </span>
                   </div>
 
@@ -1887,13 +1889,13 @@ export default function App() {
                     onClick={handleSaveApiKey}
                     className="py-2.5 rounded-xl border border-indigo-500/40 bg-indigo-950/50 hover:bg-indigo-900/40 text-indigo-200 text-xs font-serif tracking-widest cursor-pointer text-center transition-colors"
                   >
-                    保存 Key 标本
+                    查看变量名
                   </button>
                   <button
                     onClick={handleClearApiKey}
                     className="py-2.5 rounded-xl border border-white/[0.05] hover:border-red-900/20 hover:bg-red-950/10 text-gray-400 hover:text-red-300 text-xs font-serif tracking-widest cursor-pointer text-center transition-colors"
                   >
-                    清空 Key 记忆
+                    清空本地输入
                   </button>
                 </div>
 
@@ -1918,7 +1920,7 @@ export default function App() {
 
               {/* Hackathon Disclaimer */}
               <p className="text-[9.5px] text-gray-500 font-serif leading-relaxed text-center select-none pt-2 border-t border-white/[0.03]">
-                “Hackathon Demo 临时方案：API Key 仅保存在当前浏览器 localStorage。正式上线需通过后端代理保护密钥。”
+                “Hackathon Demo 稳定方案：前端请求 Netlify Function，由服务端读取 GEMINI_API_KEY 并调用 Gemini。”
               </p>
             </motion.div>
           </div>

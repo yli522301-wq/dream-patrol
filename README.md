@@ -14,6 +14,7 @@ View your app in browser: https://glittering-pudding-6755b7.netlify.app
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Set `GEMINI_API_KEY` in Netlify environment variables for deployed Gemini replies.
+   For local Netlify testing, put `GEMINI_API_KEY=...` in `.env.local` and run with Netlify Dev.
 3. Run the app:
    `npm run dev`
