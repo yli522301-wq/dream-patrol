@@ -1,0 +1,8 @@
+{
+  "name": "巡梦",
+  "description": "一本会接住散装梦境的梦中日记本。在模糊的梦境碎片中，还原、追寻并保存你快要消失的梦境记忆。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
