@@ -6,8 +6,7 @@
 
 This contains everything you need to run your app locally.
 
-View your app in AI Studio: https://ai.studio/apps/22b23c8c-ff9d-40f4-816d-9067af97396b
-
+View your app in browser: https://glittering-pudding-6755b7.netlify.app
 ## Run Locally
 
 **Prerequisites:**  Node.js
